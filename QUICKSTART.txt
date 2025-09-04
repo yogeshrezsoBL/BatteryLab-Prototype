@@ -1,0 +1,16 @@
+QUICKSTART (Pick ONE)
+
+WINDOWS (no coding):
+1) Double-click: RUN_BATTERYLAB_WINDOWS.bat
+2) A window will open, install stuff, then launch BatteryLab in your browser.
+3) When done, just close the browser tab and the window.
+
+macOS / LINUX (no coding):
+1) Open Terminal in this folder.
+2) Run:  chmod +x ./run_batterylab_mac_linux.sh
+3) Then run:  ./run_batterylab_mac_linux.sh
+4) Your browser will open BatteryLab automatically.
+
+If something fails, install Python 3.10+ first:
+- Windows: https://www.python.org/downloads/windows/
+- macOS:   https://www.python.org/downloads/macos/
