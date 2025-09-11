@@ -15,4 +15,6 @@ This prototype combines:
 - Predict **early degradation trends** and state-of-health
 - Hybrid modeling: physics-based + machine learning
 - Prototype Streamlit app for scouts & demos
+- **[Try the Live Prototype]**
+- https://yoge-batterylab-prototype.streamlit.app/
 
