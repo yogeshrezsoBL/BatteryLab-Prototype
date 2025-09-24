@@ -4,9 +4,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# optional imports (only used if available)
+# Optional (for analytics)
 try:
-    from scipy.signal import savgol_filter, find_peaks
+    from scipy.signal import savgol_filter, find_peaks, peak_widths
     from scipy.io import loadmat
     SCIPY_OK = True
 except Exception:
@@ -16,7 +16,7 @@ from batterylab_recipe_engine import ElectrodeSpec, CellDesignInput, design_pouc
 
 st.set_page_config(page_title="BatteryLab Prototype", page_icon="🔋", layout="wide")
 st.title("🔋 BatteryLab — Prototype")
-st.caption("Core promise: Enter an electrode recipe → get performance + feasibility + AI suggestions. New: upload a dataset → get analytics, plots, and interpretations. (Prototype, first-order estimates)")
+st.caption("Core promise: Enter an electrode recipe → get performance + feasibility + AI suggestions. New: upload a dataset → get analytics, plots, and dynamic interpretations. (Prototype, first-order estimates)")
 
 # =========================
 # Tabs
@@ -158,142 +158,244 @@ with tab1:
         st.info("Pick a preset for a 1-click demo, or set your recipe parameters, then press **Compute Performance →**")
 
 # =========================
-# TAB 2: Data Analytics (CSV/MAT)
+# Utilities for Analytics
+# =========================
+def _standardize_columns(df: pd.DataFrame):
+    cols_l = [c.lower() for c in df.columns]
+    # find voltage
+    vcol = None
+    for i, c in enumerate(cols_l):
+        if c in ["v", "volt", "voltage", "voltage_v"]:
+            vcol = df.columns[i]; break
+    # find capacity
+    qcol = None
+    for i, c in enumerate(cols_l):
+        if "capacity" in c or c in ["q", "ah", "mah", "capacity_ah", "capacity_mah"]:
+            qcol = df.columns[i]; break
+    # cycle/label column (optional)
+    cyc = None
+    for i, c in enumerate(cols_l):
+        if c in ["cycle", "label", "group"]:
+            cyc = df.columns[i]; break
+    return vcol, qcol, cyc
+
+def _prep_series(voltage, capacity):
+    V = pd.to_numeric(voltage, errors="coerce").to_numpy()
+    Qraw = pd.to_numeric(capacity, errors="coerce").to_numpy()
+    # convert mAh to Ah if needed (heuristic on column name handled earlier; here we also catch numeric scale)
+    if np.nanmax(Qraw) > 100:  # likely in mAh
+        Q = Qraw / 1000.0
+    else:
+        Q = Qraw
+    mask = np.isfinite(V) & np.isfinite(Q)
+    V = V[mask]; Q = Q[mask]
+    order = np.argsort(V)
+    return V[order], Q[order]
+
+def _extract_features(V, Q):
+    # Smooth for derivative stability
+    Qs = Q.copy()
+    if SCIPY_OK and len(Q) >= 11:
+        try:
+            Qs = savgol_filter(Q, 11, 3)
+        except Exception:
+            pass
+    # ICA
+    dQdV = np.gradient(Qs, V, edge_order=2)
+    # Peaks
+    peak_info = {"n_peaks": 0, "voltages": [], "widths_V": []}
+    if SCIPY_OK and np.isfinite(dQdV).any():
+        try:
+            prom = np.nanmax(np.abs(dQdV))*0.05 if np.nanmax(np.abs(dQdV))>0 else 0.0
+            peaks, props = find_peaks(dQdV, prominence=prom)
+            peak_info["n_peaks"] = int(len(peaks))
+            peak_info["voltages"] = [float(V[p]) for p in peaks]
+            if len(peaks) > 0:
+                widths, h, left, right = peak_widths(dQdV, peaks, rel_height=0.5)
+                # convert width from samples to volts (approx via local spacing)
+                if len(V) > 1:
+                    dv = np.mean(np.diff(V))
+                    peak_info["widths_V"] = [float(w*dv) for w in widths]
+        except Exception:
+            pass
+    # dV/dQ for impedance proxy (median abs)
+    try:
+        dVdQ = np.gradient(V, Qs, edge_order=2)
+        dVdQ_med = float(np.nanmedian(np.abs(dVdQ)))
+    except Exception:
+        dVdQ_med = float("nan")
+    return dQdV, peak_info, dVdQ_med
+
+def _compare_two_sets(name_a, feat_a, name_b, feat_b):
+    """Return interpretations comparing A vs B using simple heuristics."""
+    interp = []
+    # Capacity fade (needs capacity ranges)
+    cap_a = feat_a.get("cap_range_Ah", [np.nan, np.nan])[1]
+    cap_b = feat_b.get("cap_range_Ah", [np.nan, np.nan])[1]
+    if np.isfinite(cap_a) and np.isfinite(cap_b) and cap_a > 0:
+        fade_pct = 100.0 * (cap_a - cap_b) / cap_a
+        if abs(fade_pct) >= 3:
+            interp.append(f"Capacity change from {name_a} to {name_b}: {fade_pct:.1f}% (negative = fade).")
+
+    # Peak shifts
+    Va = feat_a.get("ica_peak_voltages_V", [])
+    Vb = feat_b.get("ica_peak_voltages_V", [])
+    if Va and Vb:
+        n = min(len(Va), len(Vb))
+        if n >= 1:
+            mean_shift_mV = 1000.0 * float(np.nanmean(np.array(Vb[:n]) - np.array(Va[:n])))
+            if abs(mean_shift_mV) >= 5:
+                direction = "↑" if mean_shift_mV > 0 else "↓"
+                interp.append(f"Average ICA peak shift {direction} ~{abs(mean_shift_mV):.0f} mV ({name_b} vs {name_a}) → possible LLI or cathode aging.")
+
+    # Peak broadening (widths)
+    Wa = feat_a.get("ica_peak_widths_V", [])
+    Wb = feat_b.get("ica_peak_widths_V", [])
+    if Wa and Wb:
+        n = min(len(Wa), len(Wb))
+        if n >= 1:
+            mean_broad_mV = 1000.0 * float(np.nanmean(np.array(Wb[:n]) - np.array(Wa[:n])))
+            if mean_broad_mV > 2:  # >2 mV is small but visible
+                interp.append(f"ICA peak broadening ~{mean_broad_mV:.0f} mV ({name_b} vs {name_a}) → rising impedance / polarization.")
+
+    # Impedance proxy via |dV/dQ| median
+    iva = feat_a.get("dVdQ_median_abs", np.nan)
+    ivb = feat_b.get("dVdQ_median_abs", np.nan)
+    if np.isfinite(iva) and np.isfinite(ivb) and ivb > iva*1.05:
+        interp.append(f"Median |dV/dQ| increased ({name_b} vs {name_a}) → higher polarization/impedance.")
+
+    if not interp:
+        interp.append(f"No strong differences detected between {name_a} and {name_b} within prototype sensitivity.")
+    return interp
+
+# =========================
+# TAB 2: Data Analytics
 # =========================
 with tab2:
     st.subheader("Upload a dataset")
-    st.write("Accepted: **.csv** (recommended) or **.mat** (if SciPy is available). Expect columns like: `Voltage` (V) and `Capacity_Ah` (or `Capacity_mAh`).")
+    st.write("Accepted: **.csv** (recommended) or **.mat** (if SciPy is available). Columns: `Voltage` and `Capacity_Ah` (or `Capacity_mAh`). Optional: `Cycle` (e.g., Fresh/Aged).")
 
     up = st.file_uploader("Upload CSV or MAT file", type=["csv", "mat"])
     if up is not None:
         with st.spinner("Parsing and extracting features…"):
-            # 1) Load data
+            # 1) Load
             df = None
             name = up.name.lower()
             if name.endswith(".csv"):
                 df = pd.read_csv(up)
             elif name.endswith(".mat"):
                 if not SCIPY_OK:
-                    st.error("SciPy is not available on this runtime. Please upload a CSV for now.")
+                    st.error("SciPy not available. Please upload a CSV for now.")
                 else:
                     mat = loadmat(io.BytesIO(up.getvalue()))
-                    # Heuristic: find arrays that look like V and Q
                     candidates = {k: np.squeeze(v) for k, v in mat.items() if isinstance(v, np.ndarray) and v.size > 3}
-                    # try common names
                     V = None; Q = None
-                    for key in candidates:
+                    for key, arr in candidates.items():
                         lk = key.lower()
                         if V is None and ("volt" in lk or lk == "v"):
-                            V = candidates[key]
-                        if Q is None and ("cap" in lk or lk in ["q", "capacity", "capacity_ah", "capacity_mah"]):
-                            Q = candidates[key]
+                            V = arr
+                        if Q is None and ("cap" in lk or lk in ["q","capacity","capacity_ah","capacity_mah"]):
+                            Q = arr
                     if V is None or Q is None:
-                        st.error("Could not locate voltage/capacity arrays in .mat. Use CSV with columns: Voltage, Capacity_Ah/Capacity_mAh.")
+                        st.error("Could not find voltage/capacity arrays in .mat. Use CSV with `Voltage`, `Capacity_Ah`.")
                     else:
                         df = pd.DataFrame({"Voltage": V, "Capacity": Q})
 
             if df is not None:
-                # 2) Standardize column names
-                cols_l = [c.lower() for c in df.columns]
-                # find voltage
-                vcol = None
-                for i, c in enumerate(cols_l):
-                    if c in ["v", "volt", "voltage", "voltage_v"]:
-                        vcol = df.columns[i]; break
-                # find capacity
-                qcol = None
-                for i, c in enumerate(cols_l):
-                    if "capacity" in c or c in ["q", "ah", "mah", "capacity_ah", "capacity_mah"]:
-                        qcol = df.columns[i]; break
-
+                # 2) Standardize
+                vcol, qcol, cyc = _standardize_columns(df)
                 if vcol is None or qcol is None:
-                    st.error("Please include columns for Voltage and Capacity (Ah or mAh). Example headers: `Voltage`, `Capacity_Ah`.")
+                    st.error("Please include `Voltage` and `Capacity_Ah` (or `Capacity_mAh`).")
                     st.stop()
 
-                V = pd.to_numeric(df[vcol], errors="coerce").to_numpy()
-                Qraw = pd.to_numeric(df[qcol], errors="coerce").to_numpy()
+                # If Cycle missing, treat whole file as one curve
+                if cyc is None:
+                    df["_Cycle"] = "Curve1"
+                    cyc = "_Cycle"
 
-                # convert capacity to Ah if needed
-                if "mah" in qcol.lower():
-                    Q = Qraw / 1000.0
-                else:
-                    Q = Qraw
+                # 3) Process each group
+                groups = list(df[cyc].astype(str).unique())
+                features_by_group = {}
+                plots_done = False
 
-                # Remove NaNs and sort by increasing Voltage
-                mask = np.isfinite(V) & np.isfinite(Q)
-                V = V[mask]; Q = Q[mask]
-                order = np.argsort(V)
-                V = V[order]; Q = Q[order]
-
-                # 3) Smooth (optional) and derivatives
-                Q_s = Q.copy()
-                if SCIPY_OK and len(Q) >= 11:
-                    try:
-                        Q_s = savgol_filter(Q, 11, 3)
-                    except Exception:
-                        pass
-
-                # dQ/dV (ICA)
-                dQdV = np.gradient(Q_s, V, edge_order=2)
-
-                # dV/dQ (differential voltage) - guard for monotonic Q
-                try:
-                    dVdQ = np.gradient(V, Q_s, edge_order=2)
-                except Exception:
-                    dVdQ = np.full_like(V, np.nan)
-
-                # 4) Simple peak metrics on ICA
-                peak_info = {}
-                if SCIPY_OK:
-                    try:
-                        peaks, props = find_peaks(dQdV, prominence=np.nanmax(np.abs(dQdV))*0.05 if np.nanmax(np.abs(dQdV))>0 else 0.0)
-                        peak_info = {
-                            "n_peaks": int(len(peaks)),
-                            "peak_voltages": [float(V[p]) for p in peaks[:5]],
-                        }
-                    except Exception:
-                        peak_info = {"n_peaks": int(np.nan), "peak_voltages": []}
-
-                # 5) Plots
                 st.markdown("### Plots")
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.line_chart(pd.DataFrame({"Voltage (V)": V, "Capacity (Ah)": Q}))
-                    st.caption("Voltage vs Capacity")
-                with c2:
-                    st.line_chart(pd.DataFrame({"Voltage (V)": V, "dQ/dV (Ah/V)": dQdV}))
-                    st.caption("Incremental Capacity (ICA): dQ/dV vs Voltage")
+                cols = st.columns(2)
 
-                st.markdown("### Key Features (auto-extracted)")
-                st.write({
-                    "Samples": int(len(V)),
-                    "Capacity range (Ah)": [float(np.nanmin(Q)), float(np.nanmax(Q))],
-                    "Voltage range (V)": [float(np.nanmin(V)), float(np.nanmax(V))],
-                    "ICA peaks (count)": peak_info.get("n_peaks", "n/a"),
-                    "ICA peak voltages (V)": peak_info.get("peak_voltages", []),
-                })
+                for g in groups:
+                    sub = df[df[cyc].astype(str) == g]
+                    V, Q = _prep_series(sub[vcol], sub[qcol])
+                    if len(V) < 5:
+                        continue
+                    dQdV, peak_info, dVdQ_med = _extract_features(V, Q)
 
-                # 6) Interpretations (heuristics, safe & useful)
-                st.markdown("### AI-style Interpretations")
-                bullets = []
-                # generic, safe insights:
-                bullets.append("Distinct ICA peaks often indicate well-defined phase transitions; broadening over time can suggest rising impedance.")
-                bullets.append("Horizontal shifts in Voltage–Capacity curves between cycles typically indicate loss of lithium inventory (LLI).")
-                bullets.append("Reduced ICA peak heights at similar state-of-charge can suggest loss of active material (LAM) or increased polarization.")
-                if SCIPY_OK and peak_info.get("n_peaks", 0) >= 2:
-                    bullets.append("Multiple ICA peaks detected — consider tracking peak positions across cycles to monitor aging modes.")
-                bullets.append("Next steps: compare early vs late-cycle ICA to quantify degradation, and correlate with IR/temperature if available.")
-                for b in bullets:
+                    # Save features
+                    features_by_group[g] = {
+                        "n_samples": int(len(V)),
+                        "voltage_range_V": [float(np.nanmin(V)), float(np.nanmax(V))],
+                        "cap_range_Ah": [float(np.nanmin(Q)), float(np.nanmax(Q))],
+                        "ica_peaks_count": int(peak_info.get("n_peaks", 0)),
+                        "ica_peak_voltages_V": peak_info.get("voltages", []),
+                        "ica_peak_widths_V": peak_info.get("widths_V", []),
+                        "dVdQ_median_abs": dVdQ_med,
+                    }
+
+                    # Plots per group (side-by-side)
+                    vc_df = pd.DataFrame({"Voltage (V)": V, f"Capacity_Ah [{g}]": Q})
+                    ica_df = pd.DataFrame({"Voltage (V)": V, f"dQ/dV (Ah/V) [{g}]": dQdV})
+                    with cols[0]:
+                        st.line_chart(vc_df.set_index("Voltage (V)"))
+                    with cols[1]:
+                        st.line_chart(ica_df.set_index("Voltage (V)"))
+                    plots_done = True
+
+                if not plots_done:
+                    st.error("Not enough valid data points to plot.")
+                    st.stop()
+
+                # 4) Show features
+                st.markdown("### Key Features by Curve")
+                st.write(features_by_group)
+
+                # 5) Dynamic interpretations
+                st.markdown("### AI-style Interpretations (dynamic)")
+                interps = []
+                if len(features_by_group) == 1:
+                    g = list(features_by_group.keys())[0]
+                    f = features_by_group[g]
+                    interps += [
+                        "Distinct ICA peaks often indicate well-defined phase transitions.",
+                        "Broadening of ICA peaks over time is a common sign of rising impedance.",
+                        "Compare this curve to an earlier/later cycle to quantify fade and peak shifts.",
+                    ]
+                else:
+                    # Compare first two groups (e.g., Fresh vs Aged)
+                    gnames = list(features_by_group.keys())[:2]
+                    fA, fB = features_by_group[gnames[0]], features_by_group[gnames[1]]
+
+                    # build comparison-friendly dicts
+                    featA = {
+                        "cap_range_Ah": fA["cap_range_Ah"],
+                        "ica_peak_voltages_V": fA["ica_peak_voltages_V"],
+                        "ica_peak_widths_V": fA["ica_peak_widths_V"],
+                        "dVdQ_median_abs": fA["dVdQ_median_abs"],
+                    }
+                    featB = {
+                        "cap_range_Ah": fB["cap_range_Ah"],
+                        "ica_peak_voltages_V": fB["ica_peak_voltages_V"],
+                        "ica_peak_widths_V": fB["ica_peak_widths_V"],
+                        "dVdQ_median_abs": fB["dVdQ_median_abs"],
+                    }
+                    interps = _compare_two_sets(gnames[0], featA, gnames[1], featB)
+
+                for b in interps:
                     st.write("• " + b)
 
-                # 7) Download features
-                features = {
-                    "capacity_range_Ah": [float(np.nanmin(Q)), float(np.nanmax(Q))],
-                    "voltage_range_V": [float(np.nanmin(V)), float(np.nanmax(V))],
-                    "ica_peaks_count": peak_info.get("n_peaks", None),
-                    "ica_peak_voltages_V": peak_info.get("peak_voltages", []),
-                }
-                st.download_button("Download extracted features (JSON)", data=json.dumps(features, indent=2),
-                                   file_name="BatteryLab_analytics_features.json", mime="application/json")
+                # 6) Download features
+                st.download_button(
+                    "Download extracted features (JSON)",
+                    data=json.dumps(features_by_group, indent=2),
+                    file_name="BatteryLab_analytics_features.json",
+                    mime="application/json"
+                )
     else:
-        st.info("Upload a **CSV** with columns like `Voltage` and `Capacity_Ah` (or `Capacity_mAh`). Optionally, a **MAT** file if SciPy is available.")
+        st.info("Upload a **CSV** with `Voltage`, `Capacity_Ah` (or `Capacity_mAh`). Optionally include `Cycle` (e.g., Fresh/Aged). MAT is supported if SciPy is available.")
