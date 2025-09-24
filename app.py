@@ -3,8 +3,9 @@ import io
 import numpy as np
 import pandas as pd
 import streamlit as st
+import altair as alt
 
-# Optional (for analytics)
+# Optional (for analytics on MAT + feature extraction)
 try:
     from scipy.signal import savgol_filter, find_peaks, peak_widths
     from scipy.io import loadmat
@@ -16,7 +17,10 @@ from batterylab_recipe_engine import ElectrodeSpec, CellDesignInput, design_pouc
 
 st.set_page_config(page_title="BatteryLab Prototype", page_icon="🔋", layout="wide")
 st.title("🔋 BatteryLab — Prototype")
-st.caption("Core promise: Enter an electrode recipe → get performance + feasibility + AI suggestions. New: upload a dataset → get analytics, plots, and dynamic interpretations. (Prototype, first-order estimates)")
+st.caption(
+    "Core promise: Enter an electrode recipe → get performance + feasibility + AI suggestions. "
+    "New: upload a dataset → get analytics, plots, and dynamic interpretations. (Prototype, first-order estimates)"
+)
 
 # =========================
 # Tabs
@@ -162,17 +166,17 @@ with tab1:
 # =========================
 def _standardize_columns(df: pd.DataFrame):
     cols_l = [c.lower() for c in df.columns]
-    # find voltage
+    # voltage
     vcol = None
     for i, c in enumerate(cols_l):
         if c in ["v", "volt", "voltage", "voltage_v"]:
             vcol = df.columns[i]; break
-    # find capacity
+    # capacity
     qcol = None
     for i, c in enumerate(cols_l):
         if "capacity" in c or c in ["q", "ah", "mah", "capacity_ah", "capacity_mah"]:
             qcol = df.columns[i]; break
-    # cycle/label column (optional)
+    # cycle label (optional)
     cyc = None
     for i, c in enumerate(cols_l):
         if c in ["cycle", "label", "group"]:
@@ -182,8 +186,8 @@ def _standardize_columns(df: pd.DataFrame):
 def _prep_series(voltage, capacity):
     V = pd.to_numeric(voltage, errors="coerce").to_numpy()
     Qraw = pd.to_numeric(capacity, errors="coerce").to_numpy()
-    # convert mAh to Ah if needed (heuristic on column name handled earlier; here we also catch numeric scale)
-    if np.nanmax(Qraw) > 100:  # likely in mAh
+    # convert mAh → Ah if numeric scale suggests it
+    if np.nanmax(Qraw) > 100:  # likely mAh
         Q = Qraw / 1000.0
     else:
         Q = Qraw
@@ -212,31 +216,30 @@ def _extract_features(V, Q):
             peak_info["voltages"] = [float(V[p]) for p in peaks]
             if len(peaks) > 0:
                 widths, h, left, right = peak_widths(dQdV, peaks, rel_height=0.5)
-                # convert width from samples to volts (approx via local spacing)
                 if len(V) > 1:
                     dv = np.mean(np.diff(V))
                     peak_info["widths_V"] = [float(w*dv) for w in widths]
         except Exception:
             pass
-    # dV/dQ for impedance proxy (median abs)
+    # Impedance proxy via |dV/dQ|
     try:
         dVdQ = np.gradient(V, Qs, edge_order=2)
         dVdQ_med = float(np.nanmedian(np.abs(dVdQ)))
     except Exception:
         dVdQ_med = float("nan")
+
     return dQdV, peak_info, dVdQ_med
 
 def _compare_two_sets(name_a, feat_a, name_b, feat_b):
     """Return interpretations comparing A vs B using simple heuristics."""
     interp = []
-    # Capacity fade (needs capacity ranges)
+    # Capacity fade
     cap_a = feat_a.get("cap_range_Ah", [np.nan, np.nan])[1]
     cap_b = feat_b.get("cap_range_Ah", [np.nan, np.nan])[1]
     if np.isfinite(cap_a) and np.isfinite(cap_b) and cap_a > 0:
         fade_pct = 100.0 * (cap_a - cap_b) / cap_a
         if abs(fade_pct) >= 3:
             interp.append(f"Capacity change from {name_a} to {name_b}: {fade_pct:.1f}% (negative = fade).")
-
     # Peak shifts
     Va = feat_a.get("ica_peak_voltages_V", [])
     Vb = feat_b.get("ica_peak_voltages_V", [])
@@ -247,21 +250,19 @@ def _compare_two_sets(name_a, feat_a, name_b, feat_b):
             if abs(mean_shift_mV) >= 5:
                 direction = "↑" if mean_shift_mV > 0 else "↓"
                 interp.append(f"Average ICA peak shift {direction} ~{abs(mean_shift_mV):.0f} mV ({name_b} vs {name_a}) → possible LLI or cathode aging.")
-
-    # Peak broadening (widths)
+    # Peak broadening
     Wa = feat_a.get("ica_peak_widths_V", [])
     Wb = feat_b.get("ica_peak_widths_V", [])
     if Wa and Wb:
         n = min(len(Wa), len(Wb))
         if n >= 1:
             mean_broad_mV = 1000.0 * float(np.nanmean(np.array(Wb[:n]) - np.array(Wa[:n])))
-            if mean_broad_mV > 2:  # >2 mV is small but visible
+            if mean_broad_mV > 2:
                 interp.append(f"ICA peak broadening ~{mean_broad_mV:.0f} mV ({name_b} vs {name_a}) → rising impedance / polarization.")
-
-    # Impedance proxy via |dV/dQ| median
+    # Impedance proxy
     iva = feat_a.get("dVdQ_median_abs", np.nan)
     ivb = feat_b.get("dVdQ_median_abs", np.nan)
-    if np.isfinite(iva) and np.isfinite(ivb) and ivb > iva*1.05:
+    if np.isfinite(iva) and np.isfinite(ivb) and ivb > iva * 1.05:
         interp.append(f"Median |dV/dQ| increased ({name_b} vs {name_a}) → higher polarization/impedance.")
 
     if not interp:
@@ -273,7 +274,10 @@ def _compare_two_sets(name_a, feat_a, name_b, feat_b):
 # =========================
 with tab2:
     st.subheader("Upload a dataset")
-    st.write("Accepted: **.csv** (recommended) or **.mat** (if SciPy is available). Columns: `Voltage` and `Capacity_Ah` (or `Capacity_mAh`). Optional: `Cycle` (e.g., Fresh/Aged).")
+    st.write(
+        "Accepted: **.csv** (recommended) or **.mat** (if SciPy is available). "
+        "Columns: `Voltage` and `Capacity_Ah` (or `Capacity_mAh`). Optional: `Cycle` (e.g., Fresh/Aged)."
+    )
 
     up = st.file_uploader("Upload CSV or MAT file", type=["csv", "mat"])
     if up is not None:
@@ -288,7 +292,8 @@ with tab2:
                     st.error("SciPy not available. Please upload a CSV for now.")
                 else:
                     mat = loadmat(io.BytesIO(up.getvalue()))
-                    candidates = {k: np.squeeze(v) for k, v in mat.items() if isinstance(v, np.ndarray) and v.size > 3}
+                    candidates = {k: np.squeeze(v) for k, v in mat.items()
+                                  if isinstance(v, np.ndarray) and v.size > 3}
                     V = None; Q = None
                     for key, arr in candidates.items():
                         lk = key.lower()
@@ -307,25 +312,21 @@ with tab2:
                 if vcol is None or qcol is None:
                     st.error("Please include `Voltage` and `Capacity_Ah` (or `Capacity_mAh`).")
                     st.stop()
-
-                # If Cycle missing, treat whole file as one curve
                 if cyc is None:
                     df["_Cycle"] = "Curve1"
                     cyc = "_Cycle"
 
-                # 3) Process each group
+                # 3) Process each group and build combined plotting frames
                 groups = list(df[cyc].astype(str).unique())
                 features_by_group = {}
-                plots_done = False
-
-                st.markdown("### Plots")
-                cols = st.columns(2)
+                vc_all_rows, ica_all_rows = [], []
 
                 for g in groups:
                     sub = df[df[cyc].astype(str) == g]
                     V, Q = _prep_series(sub[vcol], sub[qcol])
                     if len(V) < 5:
                         continue
+
                     dQdV, peak_info, dVdQ_med = _extract_features(V, Q)
 
                     # Save features
@@ -339,18 +340,45 @@ with tab2:
                         "dVdQ_median_abs": dVdQ_med,
                     }
 
-                    # Plots per group (side-by-side)
-                    vc_df = pd.DataFrame({"Voltage (V)": V, f"Capacity_Ah [{g}]": Q})
-                    ica_df = pd.DataFrame({"Voltage (V)": V, f"dQ/dV (Ah/V) [{g}]": dQdV})
-                    with cols[0]:
-                        st.line_chart(vc_df.set_index("Voltage (V)"))
-                    with cols[1]:
-                        st.line_chart(ica_df.set_index("Voltage (V)"))
-                    plots_done = True
+                    # Collect rows for combined Altair plots
+                    vc_all_rows.append(pd.DataFrame({"Voltage": V, "Capacity_Ah": Q, "Cycle": g}))
+                    ica_all_rows.append(pd.DataFrame({"Voltage": V, "dQdV": dQdV, "Cycle": g}))
 
-                if not plots_done:
+                if not features_by_group:
                     st.error("Not enough valid data points to plot.")
                     st.stop()
+
+                # ---- Altair Plots (reliable multi-curve) ----
+                st.markdown("### Plots")
+                vc_all = pd.concat(vc_all_rows, ignore_index=True)
+                ica_all = pd.concat(ica_all_rows, ignore_index=True)
+
+                vc_chart = (
+                    alt.Chart(vc_all)
+                    .mark_line()
+                    .encode(
+                        x=alt.X("Voltage:Q", title="Voltage (V)"),
+                        y=alt.Y("Capacity_Ah:Q", title="Capacity (Ah)"),
+                        color=alt.Color("Cycle:N", title="Curve")
+                    )
+                    .properties(title="Voltage vs Capacity")
+                )
+                ica_chart = (
+                    alt.Chart(ica_all)
+                    .mark_line()
+                    .encode(
+                        x=alt.X("Voltage:Q", title="Voltage (V)"),
+                        y=alt.Y("dQdV:Q", title="dQ/dV (Ah/V)"),
+                        color=alt.Color("Cycle:N", title="Curve")
+                    )
+                    .properties(title="ICA: dQ/dV vs Voltage")
+                )
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.altair_chart(vc_chart, use_container_width=True)
+                with c2:
+                    st.altair_chart(ica_chart, use_container_width=True)
 
                 # 4) Show features
                 st.markdown("### Key Features by Curve")
@@ -368,11 +396,9 @@ with tab2:
                         "Compare this curve to an earlier/later cycle to quantify fade and peak shifts.",
                     ]
                 else:
-                    # Compare first two groups (e.g., Fresh vs Aged)
+                    # Compare the first two groups (e.g., Fresh vs Aged)
                     gnames = list(features_by_group.keys())[:2]
                     fA, fB = features_by_group[gnames[0]], features_by_group[gnames[1]]
-
-                    # build comparison-friendly dicts
                     featA = {
                         "cap_range_Ah": fA["cap_range_Ah"],
                         "ica_peak_voltages_V": fA["ica_peak_voltages_V"],
