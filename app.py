@@ -10,7 +10,6 @@ from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
-from reportlab.lib.utils import ImageReader
 import matplotlib
 matplotlib.use("Agg")  # headless backend for Streamlit cloud
 import matplotlib.pyplot as plt
@@ -291,9 +290,9 @@ def _compare_two_sets(name_a, feat_a, name_b, feat_b):
         interp.append(f"No strong differences detected between {name_a} and {name_b} within prototype sensitivity.")
     return interp
 
-# ============ PDF generator ============
-def _plot_to_imagereader(df_all, ycol, title):
-    """Build a matplotlib plot into an ImageReader object for ReportLab."""
+# ---------- FIXED: plot -> PNG bytes for ReportLab ----------
+def _plot_to_bytes(df_all, ycol, title):
+    """Return PNG bytes for a plot so it can be embedded in a PDF."""
     fig, ax = plt.subplots(figsize=(6.2, 3.8), dpi=150)
     for c in df_all["Cycle"].unique():
         sub = df_all[df_all["Cycle"] == c]
@@ -307,7 +306,7 @@ def _plot_to_imagereader(df_all, ycol, title):
     fig.savefig(buf, format="png", dpi=150)
     plt.close(fig)
     buf.seek(0)
-    return ImageReader(buf)
+    return buf.getvalue()
 
 def generate_pdf_report(features_by_group, richness_notes, suggestions, interps, vc_all, ica_all):
     buffer = io.BytesIO()
@@ -373,14 +372,16 @@ def generate_pdf_report(features_by_group, richness_notes, suggestions, interps,
         elements.append(Paragraph("No interpretations generated.", styles["Normal"]))
     elements.append(Spacer(1, 6))
 
-    # Plots
+    # Plots (now via PNG bytes in memory)
     elements.append(Paragraph("Visualizations", styles["Heading2"]))
     if vc_all is not None and len(vc_all) > 0:
         elements.append(Paragraph("Voltage vs Capacity", styles["Heading3"]))
-        elements.append(Image(_plot_to_imagereader(vc_all, "Capacity_Ah", "Voltage vs Capacity"), width=420, height=270))
+        img_bytes = _plot_to_bytes(vc_all, "Capacity_Ah", "Voltage vs Capacity")
+        elements.append(Image(io.BytesIO(img_bytes), width=420, height=270))
     if ica_all is not None and len(ica_all) > 0:
         elements.append(Paragraph("ICA: dQ/dV vs Voltage", styles["Heading3"]))
-        elements.append(Image(_plot_to_imagereader(ica_all, "dQdV", "ICA: dQ/dV vs Voltage"), width=420, height=270))
+        img_bytes = _plot_to_bytes(ica_all, "dQdV", "ICA: dQ/dV vs Voltage")
+        elements.append(Image(io.BytesIO(img_bytes), width=420, height=270))
 
     # Build PDF
     doc.build(elements)
@@ -474,7 +475,7 @@ with tab2:
                 if len(features_by_group) >= 2:
                     richness_notes.append("✅ Multiple curves detected → enables trend comparisons (fade, peak shifts, impedance).")
                 else:
-                    richness_notes.append("ℹ️ Single curve detected → add an aged or baseline curve for richer insights.")
+                    richness_notes.append(ℹ️ Single curve detected → add an aged or baseline curve for richer insights.")
                 if any(f["n_samples"] < 30 for f in features_by_group.values()):
                     richness_notes.append("⚠ Some curves have <30 points → derivatives may be noisy; consider higher-resolution sampling.")
                 if any(f["ica_peaks_count"] == 0 for f in features_by_group.values()):
@@ -594,3 +595,4 @@ with tab2:
             "Upload a **CSV** with `Voltage`, `Capacity_Ah` (or `Capacity_mAh`). "
             "Optionally include `Cycle` (e.g., Fresh/Aged). MAT is supported if SciPy is available."
         )
+
