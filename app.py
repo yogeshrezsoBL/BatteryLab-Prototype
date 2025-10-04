@@ -5,6 +5,16 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
+# For PDF export
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
+from reportlab.lib.utils import ImageReader
+import matplotlib
+matplotlib.use("Agg")  # headless backend for Streamlit cloud
+import matplotlib.pyplot as plt
+
 # Optional (for analytics on MAT + feature extraction)
 try:
     from scipy.signal import savgol_filter, find_peaks, peak_widths
@@ -19,8 +29,8 @@ st.set_page_config(page_title="BatteryLab Prototype", page_icon="🔋", layout="
 st.title("🔋 BatteryLab — Prototype")
 st.caption(
     "Core promise: Enter an electrode recipe → get performance + feasibility + AI suggestions. "
-    "New: upload a dataset → get analysis, dataset richness feedback, next-step suggestions, plots, and dynamic interpretations. "
-    "Temperature-aware guidance included. (Prototype, first-order estimates)"
+    "Upload a dataset → get analysis first (richness & next steps), then (on click) plots with dynamic interpretations. "
+    "Temperature-aware guidance included. (Prototype)"
 )
 
 # =========================
@@ -29,7 +39,7 @@ st.caption(
 tab1, tab2 = st.tabs(["Recipe → Performance", "Data Analytics (CSV/MAT)"])
 
 # =========================
-# TAB 1: Recipe → Performance
+# TAB 1: Recipe → Performance (temperature-aware)
 # =========================
 with tab1:
     PRESETS = {
@@ -149,7 +159,7 @@ with tab1:
         cols[1].markdown(f"**Thermal @3C:** {fz['thermal_flag_3C']}")
         cols[2].markdown(f"**Swelling % @100% SOC:** {round(result['mechanical']['swelling_pct_100SOC'],2)}%")
 
-        # ---- Temperature advisories & adjusted metrics (NEW) ----
+        # ---- Temperature advisories & adjusted metrics ----
         st.markdown("### Temperature Advisories")
         tg = result.get("temperature_guidance", {})
         ea = result.get("electrochem_temp_adjusted", {})
@@ -196,17 +206,14 @@ with tab1:
 # =========================
 def _standardize_columns(df: pd.DataFrame):
     cols_l = [c.lower() for c in df.columns]
-    # voltage
     vcol = None
     for i, c in enumerate(cols_l):
         if c in ["v", "volt", "voltage", "voltage_v"]:
             vcol = df.columns[i]; break
-    # capacity
     qcol = None
     for i, c in enumerate(cols_l):
         if "capacity" in c or c in ["q", "ah", "mah", "capacity_ah", "capacity_mah"]:
             qcol = df.columns[i]; break
-    # cycle label (optional)
     cyc = None
     for i, c in enumerate(cols_l):
         if c in ["cycle", "label", "group"]:
@@ -216,61 +223,49 @@ def _standardize_columns(df: pd.DataFrame):
 def _prep_series(voltage, capacity):
     V = pd.to_numeric(voltage, errors="coerce").to_numpy()
     Qraw = pd.to_numeric(capacity, errors="coerce").to_numpy()
-    # convert mAh → Ah if numeric scale suggests it
-    if np.nanmax(Qraw) > 100:  # likely mAh
-        Q = Qraw / 1000.0
-    else:
-        Q = Qraw
+    Q = Qraw / 1000.0 if np.nanmax(Qraw) > 100 else Qraw
     mask = np.isfinite(V) & np.isfinite(Q)
     V = V[mask]; Q = Q[mask]
     order = np.argsort(V)
     return V[order], Q[order]
 
 def _extract_features(V, Q):
-    # Smooth for derivative stability
     Qs = Q.copy()
     if SCIPY_OK and len(Q) >= 11:
         try:
             Qs = savgol_filter(Q, 11, 3)
         except Exception:
             pass
-    # ICA
     dQdV = np.gradient(Qs, V, edge_order=2)
-    # Peaks
     peak_info = {"n_peaks": 0, "voltages": [], "widths_V": []}
     if SCIPY_OK and np.isfinite(dQdV).any():
         try:
             prom = np.nanmax(np.abs(dQdV))*0.05 if np.nanmax(np.abs(dQdV))>0 else 0.0
-            peaks, props = find_peaks(dQdV, prominence=prom)
+            peaks, _ = find_peaks(dQdV, prominence=prom)
             peak_info["n_peaks"] = int(len(peaks))
             peak_info["voltages"] = [float(V[p]) for p in peaks]
             if len(peaks) > 0:
-                widths, h, left, right = peak_widths(dQdV, peaks, rel_height=0.5)
+                widths, _, _, _ = peak_widths(dQdV, peaks, rel_height=0.5)
                 if len(V) > 1:
                     dv = np.mean(np.diff(V))
                     peak_info["widths_V"] = [float(w*dv) for w in widths]
         except Exception:
             pass
-    # Impedance proxy via |dV/dQ|
     try:
         dVdQ = np.gradient(V, Qs, edge_order=2)
         dVdQ_med = float(np.nanmedian(np.abs(dVdQ)))
     except Exception:
         dVdQ_med = float("nan")
-
     return dQdV, peak_info, dVdQ_med
 
 def _compare_two_sets(name_a, feat_a, name_b, feat_b):
-    """Return interpretations comparing A vs B using simple heuristics."""
     interp = []
-    # Capacity fade
     cap_a = feat_a.get("cap_range_Ah", [np.nan, np.nan])[1]
     cap_b = feat_b.get("cap_range_Ah", [np.nan, np.nan])[1]
     if np.isfinite(cap_a) and np.isfinite(cap_b) and cap_a > 0:
         fade_pct = 100.0 * (cap_a - cap_b) / cap_a
         if abs(fade_pct) >= 3:
             interp.append(f"Capacity change from {name_a} to {name_b}: {fade_pct:.1f}% (negative = fade).")
-    # Peak shifts
     Va = feat_a.get("ica_peak_voltages_V", [])
     Vb = feat_b.get("ica_peak_voltages_V", [])
     if Va and Vb:
@@ -280,7 +275,6 @@ def _compare_two_sets(name_a, feat_a, name_b, feat_b):
             if abs(mean_shift_mV) >= 5:
                 direction = "↑" if mean_shift_mV > 0 else "↓"
                 interp.append(f"Average ICA peak shift {direction} ~{abs(mean_shift_mV):.0f} mV ({name_b} vs {name_a}) → possible LLI or cathode aging.")
-    # Peak broadening
     Wa = feat_a.get("ica_peak_widths_V", [])
     Wb = feat_b.get("ica_peak_widths_V", [])
     if Wa and Wb:
@@ -289,18 +283,112 @@ def _compare_two_sets(name_a, feat_a, name_b, feat_b):
             mean_broad_mV = 1000.0 * float(np.nanmean(np.array(Wb[:n]) - np.array(Wa[:n])))
             if mean_broad_mV > 2:
                 interp.append(f"ICA peak broadening ~{mean_broad_mV:.0f} mV ({name_b} vs {name_a}) → rising impedance / polarization.")
-    # Impedance proxy
     iva = feat_a.get("dVdQ_median_abs", np.nan)
     ivb = feat_b.get("dVdQ_median_abs", np.nan)
     if np.isfinite(iva) and np.isfinite(ivb) and ivb > iva * 1.05:
         interp.append(f"Median |dV/dQ| increased ({name_b} vs {name_a}) → higher polarization/impedance.")
-
     if not interp:
         interp.append(f"No strong differences detected between {name_a} and {name_b} within prototype sensitivity.")
     return interp
 
+# ============ PDF generator ============
+def _plot_to_imagereader(df_all, ycol, title):
+    """Build a matplotlib plot into an ImageReader object for ReportLab."""
+    fig, ax = plt.subplots(figsize=(6.2, 3.8), dpi=150)
+    for c in df_all["Cycle"].unique():
+        sub = df_all[df_all["Cycle"] == c]
+        ax.plot(sub["Voltage"], sub[ycol], label=str(c))
+    ax.set_xlabel("Voltage (V)")
+    ax.set_ylabel(ycol)
+    ax.set_title(title)
+    ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return ImageReader(buf)
+
+def generate_pdf_report(features_by_group, richness_notes, suggestions, interps, vc_all, ica_all):
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=24, leftMargin=24, topMargin=24, bottomMargin=24)
+    styles = getSampleStyleSheet()
+    elements = []
+
+    # Title
+    elements.append(Paragraph("BatteryLab Analytics Report", styles["Title"]))
+    elements.append(Spacer(1, 8))
+
+    # Dataset richness
+    elements.append(Paragraph("Dataset Quality & Richness", styles["Heading2"]))
+    if richness_notes:
+        for r in richness_notes:
+            elements.append(Paragraph("• " + r, styles["Normal"]))
+    else:
+        elements.append(Paragraph("No specific richness notes.", styles["Normal"]))
+    elements.append(Spacer(1, 6))
+
+    # Next-step suggestions
+    elements.append(Paragraph("Next-Step Suggestions", styles["Heading2"]))
+    if suggestions:
+        for s in suggestions:
+            elements.append(Paragraph("• " + s, styles["Normal"]))
+    else:
+        elements.append(Paragraph("No suggestions generated.", styles["Normal"]))
+    elements.append(Spacer(1, 6))
+
+    # Key features table
+    elements.append(Paragraph("Key Features by Curve", styles["Heading2"]))
+    table_data = [["Curve", "n_samples", "V Range (V)", "Capacity Range (Ah)",
+                   "ICA Peaks", "ICA Voltages (V)", "ICA Widths (V)", "Median |dV/dQ|"]]
+    for g, f in features_by_group.items():
+        table_data.append([
+            str(g),
+            f['n_samples'],
+            f"{f['voltage_range_V'][0]:.2f}–{f['voltage_range_V'][1]:.2f}",
+            f"{f['cap_range_Ah'][0]:.2f}–{f['cap_range_Ah'][1]:.2f}",
+            f['ica_peaks_count'],
+            ", ".join([f"{v:.3f}" for v in f['ica_peak_voltages_V']]) if f['ica_peak_voltages_V'] else "—",
+            ", ".join([f"{w:.3f}" for w in f['ica_peak_widths_V']]) if f['ica_peak_widths_V'] else "—",
+            f"{f['dVdQ_median_abs']:.4f}" if np.isfinite(f['dVdQ_median_abs']) else "—"
+        ])
+    tbl = Table(table_data, repeatRows=1)
+    tbl.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.black),
+        ('GRID', (0,0), (-1,-1), 0.25, colors.black),
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0,0), (-1,-1), 9),
+        ('ALIGN', (1,1), (-1,-1), 'CENTER')
+    ]))
+    elements.append(tbl)
+    elements.append(Spacer(1, 6))
+
+    # Interpretations
+    elements.append(Paragraph("AI-style Interpretations", styles["Heading2"]))
+    if interps:
+        for i in interps:
+            elements.append(Paragraph("• " + i, styles["Normal"]))
+    else:
+        elements.append(Paragraph("No interpretations generated.", styles["Normal"]))
+    elements.append(Spacer(1, 6))
+
+    # Plots
+    elements.append(Paragraph("Visualizations", styles["Heading2"]))
+    if vc_all is not None and len(vc_all) > 0:
+        elements.append(Paragraph("Voltage vs Capacity", styles["Heading3"]))
+        elements.append(Image(_plot_to_imagereader(vc_all, "Capacity_Ah", "Voltage vs Capacity"), width=420, height=270))
+    if ica_all is not None and len(ica_all) > 0:
+        elements.append(Paragraph("ICA: dQ/dV vs Voltage", styles["Heading3"]))
+        elements.append(Image(_plot_to_imagereader(ica_all, "dQdV", "ICA: dQ/dV vs Voltage"), width=420, height=270))
+
+    # Build PDF
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer.getvalue()
+
 # =========================
-# TAB 2: Data Analytics
+# TAB 2: Data Analytics (Analyze first → button to visualize → plots → features → interpretations → PDF)
 # =========================
 with tab2:
     st.subheader("Upload a dataset")
@@ -312,7 +400,6 @@ with tab2:
     up = st.file_uploader("Upload CSV or MAT file", type=["csv", "mat"])
     if up is not None:
         with st.spinner("Parsing and extracting features…"):
-            # 1) Load
             df = None
             name = up.name.lower()
             if name.endswith(".csv"):
@@ -337,7 +424,7 @@ with tab2:
                         df = pd.DataFrame({"Voltage": V, "Capacity": Q})
 
             if df is not None:
-                # 2) Standardize
+                # Standardize
                 vcol, qcol, cyc = _standardize_columns(df)
                 if vcol is None or qcol is None:
                     st.error("Please include `Voltage` and `Capacity_Ah` (or `Capacity_mAh`).")
@@ -346,7 +433,7 @@ with tab2:
                     df["_Cycle"] = "Curve1"
                     cyc = "_Cycle"
 
-                # 3) Process each group; compute features
+                # Extract features (no plotting yet)
                 groups = list(df[cyc].astype(str).unique())
                 features_by_group = {}
                 vc_all_rows, ica_all_rows = [], []
@@ -356,10 +443,7 @@ with tab2:
                     V, Q = _prep_series(sub[vcol], sub[qcol])
                     if len(V) < 5:
                         continue
-
                     dQdV, peak_info, dVdQ_med = _extract_features(V, Q)
-
-                    # Save features
                     features_by_group[g] = {
                         "n_samples": int(len(V)),
                         "voltage_range_V": [float(np.nanmin(V)), float(np.nanmax(V))],
@@ -369,8 +453,6 @@ with tab2:
                         "ica_peak_widths_V": peak_info.get("widths_V", []),
                         "dVdQ_median_abs": dVdQ_med,
                     }
-
-                    # Collect rows for Altair plots (we'll plot after feedback)
                     vc_all_rows.append(pd.DataFrame({"Voltage": V, "Capacity_Ah": Q, "Cycle": g}))
                     ica_all_rows.append(pd.DataFrame({"Voltage": V, "dQdV": dQdV, "Cycle": g}))
 
@@ -388,109 +470,125 @@ with tab2:
                         f"ICA peaks: {f['ica_peaks_count']}"
                     )
 
-                # Simple richness score (prototype heuristic)
                 richness_notes = []
                 if len(features_by_group) >= 2:
                     richness_notes.append("✅ Multiple curves detected → enables trend comparisons (fade, peak shifts, impedance).")
                 else:
                     richness_notes.append("ℹ️ Single curve detected → add an aged or baseline curve for richer insights.")
-
-                any_short = any(f["n_samples"] < 30 for f in features_by_group.values())
-                if any_short:
+                if any(f["n_samples"] < 30 for f in features_by_group.values()):
                     richness_notes.append("⚠ Some curves have <30 points → derivatives may be noisy; consider higher-resolution sampling.")
-                any_no_peaks = any(f["ica_peaks_count"] == 0 for f in features_by_group.values())
-                if any_no_peaks:
+                if any(f["ica_peaks_count"] == 0 for f in features_by_group.values()):
                     richness_notes.append("ℹ️ ICA shows few/no peaks → may indicate smooth kinetics or insufficient resolution.")
-
                 for rn in richness_notes:
                     st.write("• " + rn)
 
                 # ---- (2) NEXT-STEP SUGGESTIONS ----
                 st.markdown("### Next-Step Suggestions")
+                suggestions = []
                 if len(features_by_group) == 1:
-                    st.write("• Add a comparison curve (e.g., Fresh vs Aged, Cycle 10 vs Cycle 500) to quantify capacity fade and ICA peak shifts.")
-                    st.write("• Track ICA peak positions/widths across cycles to infer LLI vs LAM vs impedance growth.")
-                    st.write("• Include IR/temperature columns (if available) to correlate electro-thermal behavior.")
-                else:
-                    st.write("• Quantify fade: compute % capacity change between earliest and latest curves.")
-                    st.write("• Track ICA peak shifts (mV) and broadening (mV) → LLI and impedance indicators.")
-                    st.write("• Build a simple regression using extracted features to predict end-of-life or rate performance.")
-                    st.write("• If you have cycle index/time, add it to the dataset for richer trend modeling.")
-
-                # ---- (3) VISUALIZATIONS ----
-                st.markdown("### Visualizations")
-                vc_all = pd.concat(vc_all_rows, ignore_index=True)
-                ica_all = pd.concat(ica_all_rows, ignore_index=True)
-
-                vc_chart = (
-                    alt.Chart(vc_all)
-                    .mark_line()
-                    .encode(
-                        x=alt.X("Voltage:Q", title="Voltage (V)"),
-                        y=alt.Y("Capacity_Ah:Q", title="Capacity (Ah)"),
-                        color=alt.Color("Cycle:N", title="Curve")
-                    )
-                    .properties(title="Voltage vs Capacity")
-                )
-                ica_chart = (
-                    alt.Chart(ica_all)
-                    .mark_line()
-                    .encode(
-                        x=alt.X("Voltage:Q", title="Voltage (V)"),
-                        y=alt.Y("dQdV:Q", title="dQ/dV (Ah/V)"),
-                        color=alt.Color("Cycle:N", title="Curve")
-                    )
-                    .properties(title="ICA: dQ/dV vs Voltage")
-                )
-
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.altair_chart(vc_chart, use_container_width=True)
-                with c2:
-                    st.altair_chart(ica_chart, use_container_width=True)
-
-                # ---- (4) KEY FEATURES ----
-                st.markdown("### Key Features by Curve")
-                st.write(features_by_group)
-
-                # ---- (5) DYNAMIC INTERPRETATIONS ----
-                st.markdown("### AI-style Interpretations (dynamic)")
-                interps = []
-                if len(features_by_group) == 1:
-                    g = list(features_by_group.keys())[0]
-                    interps += [
-                        "Distinct ICA peaks often indicate well-defined phase transitions.",
-                        "Broadening of ICA peaks over time is a common sign of rising impedance.",
-                        "Compare this curve to an earlier/later cycle to quantify fade and peak shifts.",
+                    suggestions = [
+                        "Add a comparison curve (e.g., Fresh vs Aged, Cycle 10 vs Cycle 500) to quantify capacity fade and ICA peak shifts.",
+                        "Track ICA peak positions/widths across cycles to infer LLI vs LAM vs impedance growth.",
+                        "Include IR/temperature columns (if available) to correlate electro-thermal behavior."
                     ]
                 else:
-                    # Compare the first two groups (e.g., Fresh vs Aged)
-                    gnames = list(features_by_group.keys())[:2]
-                    fA, fB = features_by_group[gnames[0]], features_by_group[gnames[1]]
-                    featA = {
-                        "cap_range_Ah": fA["cap_range_Ah"],
-                        "ica_peak_voltages_V": fA["ica_peak_voltages_V"],
-                        "ica_peak_widths_V": fA["ica_peak_widths_V"],
-                        "dVdQ_median_abs": fA["dVdQ_median_abs"],
-                    }
-                    featB = {
-                        "cap_range_Ah": fB["cap_range_Ah"],
-                        "ica_peak_voltages_V": fB["ica_peak_voltages_V"],
-                        "ica_peak_widths_V": fB["ica_peak_widths_V"],
-                        "dVdQ_median_abs": fB["dVdQ_median_abs"],
-                    }
-                    interps = _compare_two_sets(gnames[0], featA, gnames[1], featB)
+                    suggestions = [
+                        "Quantify fade: compute % capacity change between earliest and latest curves.",
+                        "Track ICA peak shifts (mV) and broadening (mV) → LLI and impedance indicators.",
+                        "Build a simple regression using extracted features to predict end-of-life or rate performance.",
+                        "If you have cycle index/time, add it to the dataset for richer trend modeling."
+                    ]
+                for s in suggestions:
+                    st.write("• " + s)
 
-                for b in interps:
-                    st.write("• " + b)
+                # ---- (3) USER-ACTION: VISUALIZE RECOMMENDED PLOTS ----
+                st.divider()
+                do_plots = st.button("📈 Visualize recommended plots", type="primary")
 
-                # ---- (6) DOWNLOAD FEATURES ----
-                st.download_button(
-                    "Download extracted features (JSON)",
-                    data=json.dumps(features_by_group, indent=2),
-                    file_name="BatteryLab_analytics_features.json",
-                    mime="application/json"
-                )
+                if do_plots:
+                    st.markdown("### Visualizations")
+                    vc_all = pd.concat(vc_all_rows, ignore_index=True)
+                    ica_all = pd.concat(ica_all_rows, ignore_index=True)
+
+                    # On-screen Altair charts
+                    vc_chart = (
+                        alt.Chart(vc_all)
+                        .mark_line()
+                        .encode(
+                            x=alt.X("Voltage:Q", title="Voltage (V)"),
+                            y=alt.Y("Capacity_Ah:Q", title="Capacity (Ah)"),
+                            color=alt.Color("Cycle:N", title="Curve")
+                        )
+                        .properties(title="Voltage vs Capacity")
+                    )
+                    ica_chart = (
+                        alt.Chart(ica_all)
+                        .mark_line()
+                        .encode(
+                            x=alt.X("Voltage:Q", title="Voltage (V)"),
+                            y=alt.Y("dQdV:Q", title="dQ/dV (Ah/V)"),
+                            color=alt.Color("Cycle:N", title="Curve")
+                        )
+                        .properties(title="ICA: dQ/dV vs Voltage")
+                    )
+
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.altair_chart(vc_chart, use_container_width=True)
+                    with c2:
+                        st.altair_chart(ica_chart, use_container_width=True)
+
+                    # ---- (4) KEY FEATURES ----
+                    st.markdown("### Key Features by Curve")
+                    st.write(features_by_group)
+
+                    # ---- (5) DYNAMIC INTERPRETATIONS ----
+                    st.markdown("### AI-style Interpretations (dynamic)")
+                    interps = []
+                    if len(features_by_group) == 1:
+                        interps = [
+                            "Distinct ICA peaks often indicate well-defined phase transitions.",
+                            "Broadening of ICA peaks over time is a common sign of rising impedance.",
+                            "Compare this curve to an earlier/later cycle to quantify fade and peak shifts.",
+                        ]
+                    else:
+                        gnames = list(features_by_group.keys())[:2]
+                        fA, fB = features_by_group[gnames[0]], features_by_group[gnames[1]]
+                        featA = {
+                            "cap_range_Ah": fA["cap_range_Ah"],
+                            "ica_peak_voltages_V": fA["ica_peak_voltages_V"],
+                            "ica_peak_widths_V": fA["ica_peak_widths_V"],
+                            "dVdQ_median_abs": fA["dVdQ_median_abs"],
+                        }
+                        featB = {
+                            "cap_range_Ah": fB["cap_range_Ah"],
+                            "ica_peak_voltages_V": fB["ica_peak_voltages_V"],
+                            "ica_peak_widths_V": fB["ica_peak_widths_V"],
+                            "dVdQ_median_abs": fB["dVdQ_median_abs"],
+                        }
+                        interps = _compare_two_sets(gnames[0], featA, gnames[1], featB)
+
+                    for b in interps:
+                        st.write("• " + b)
+
+                    # ---- (6) DOWNLOAD FULL REPORT (PDF) ----
+                    pdf_bytes = generate_pdf_report(
+                        features_by_group=features_by_group,
+                        richness_notes=richness_notes,
+                        suggestions=suggestions,
+                        interps=interps,
+                        vc_all=vc_all,
+                        ica_all=ica_all
+                    )
+                    st.download_button(
+                        "📑 Download Full Report (PDF)",
+                        data=pdf_bytes,
+                        file_name="BatteryLab_analytics_report.pdf",
+                        mime="application/pdf"
+                    )
+                else:
+                    st.info("Click **“Visualize recommended plots”** to render Voltage–Capacity and ICA charts, "
+                            "then see Key Features, interpretations, and download the full PDF report.")
     else:
         st.info(
             "Upload a **CSV** with `Voltage`, `Capacity_Ah` (or `Capacity_mAh`). "
