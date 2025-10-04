@@ -461,27 +461,30 @@ with tab2:
                     st.error("Not enough valid data points to analyze.")
                     st.stop()
 
-                # ---- (1) DATASET QUALITY & RICHNESS ----
-                st.markdown("### Dataset Quality & Richness")
-                for g, f in features_by_group.items():
-                    st.write(
-                        f"**{g}** — {f['n_samples']} points | "
-                        f"V range: {f['voltage_range_V'][0]:.2f}–{f['voltage_range_V'][1]:.2f} V | "
-                        f"Capacity: {f['cap_range_Ah'][0]:.2f}–{f['cap_range_Ah'][1]:.2f} Ah | "
-                        f"ICA peaks: {f['ica_peaks_count']}"
-                    )
+               # ---- (1) DATASET QUALITY & RICHNESS ----
+st.markdown("### Dataset Quality & Richness")
+for g, f in features_by_group.items():
+    st.write(
+        f"**{g}** — {f['n_samples']} points | "
+        f"V range: {f['voltage_range_V'][0]:.2f}–{f['voltage_range_V'][1]:.2f} V | "
+        f"Capacity: {f['cap_range_Ah'][0]:.2f}–{f['cap_range_Ah'][1]:.2f} Ah | "
+        f"ICA peaks: {f['ica_peaks_count']}"
+    )
 
-                richness_notes = []
-                if len(features_by_group) >= 2:
-                    richness_notes.append("✅ Multiple curves detected → enables trend comparisons (fade, peak shifts, impedance).")
-                else:
-                    richness_notes.append(ℹ️ Single curve detected → add an aged or baseline curve for richer insights.")
-                if any(f["n_samples"] < 30 for f in features_by_group.values()):
-                    richness_notes.append("⚠ Some curves have <30 points → derivatives may be noisy; consider higher-resolution sampling.")
-                if any(f["ica_peaks_count"] == 0 for f in features_by_group.values()):
-                    richness_notes.append("ℹ️ ICA shows few/no peaks → may indicate smooth kinetics or insufficient resolution.")
-                for rn in richness_notes:
-                    st.write("• " + rn)
+richness_notes = []
+if len(features_by_group) >= 2:
+    richness_notes.append("Multiple curves detected -> enables trend comparisons (fade, peak shifts, impedance).")
+else:
+    richness_notes.append("Single curve detected -> add an aged or baseline curve for richer insights.")
+
+if any(f["n_samples"] < 30 for f in features_by_group.values()):
+    richness_notes.append("Some curves have <30 points -> derivatives may be noisy; consider higher-resolution sampling.")
+
+if any(f["ica_peaks_count"] == 0 for f in features_by_group.values()):
+    richness_notes.append("ICA shows few/no peaks -> may indicate smooth kinetics or insufficient resolution.")
+
+for rn in richness_notes:
+    st.write("• " + rn)
 
                 # ---- (2) NEXT-STEP SUGGESTIONS ----
                 st.markdown("### Next-Step Suggestions")
