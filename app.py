@@ -19,7 +19,8 @@ st.set_page_config(page_title="BatteryLab Prototype", page_icon="🔋", layout="
 st.title("🔋 BatteryLab — Prototype")
 st.caption(
     "Core promise: Enter an electrode recipe → get performance + feasibility + AI suggestions. "
-    "New: upload a dataset → get analytics, plots, and dynamic interpretations. (Prototype, first-order estimates)"
+    "New: upload a dataset → get analysis, dataset richness feedback, next-step suggestions, plots, and dynamic interpretations. "
+    "Temperature-aware guidance included. (Prototype, first-order estimates)"
 )
 
 # =========================
@@ -147,6 +148,35 @@ with tab1:
         cols[0].markdown(f"**Swelling flag:** {fz['swelling_flag']}")
         cols[1].markdown(f"**Thermal @3C:** {fz['thermal_flag_3C']}")
         cols[2].markdown(f"**Swelling % @100% SOC:** {round(result['mechanical']['swelling_pct_100SOC'],2)}%")
+
+        # ---- Temperature advisories & adjusted metrics (NEW) ----
+        st.markdown("### Temperature Advisories")
+        tg = result.get("temperature_guidance", {})
+        ea = result.get("electrochem_temp_adjusted", {})
+
+        cols_t = st.columns(4)
+        cols_t[0].markdown(f"**Ambient:** {tg.get('ambient_C', '—')} °C")
+        cols_t[1].markdown(f"**Ideal window:** {tg.get('ideal_low_C','—')}–{tg.get('ideal_high_C','—')} °C")
+        try:
+            eff_cap = float(ea.get('effective_capacity_Ah_at_ambient', float('nan')))
+            cols_t[2].markdown(f"**Effective Capacity @ ambient:** {eff_cap:.2f} Ah")
+        except Exception:
+            cols_t[2].markdown("**Effective Capacity @ ambient:** —")
+        try:
+            rel_pow = float(ea.get('relative_power_vs_25C', float('nan')))
+            cols_t[3].markdown(f"**Relative Power vs 25 °C:** {rel_pow:.2f}×")
+        except Exception:
+            cols_t[3].markdown("**Relative Power vs 25 °C:** —")
+
+        risk_msgs = []
+        if tg.get("cold_temp_risk", False):
+            risk_msgs.append("⚠ Cold-condition risk (≤0 °C): expect higher impedance/lower power; pre-heat or derate C-rate.")
+        if tg.get("high_temp_risk", False):
+            risk_msgs.append("⚠ High ambient (≥45 °C): accelerated side reactions; consider high-temp electrolyte, charge derating, better cooling.")
+        if not risk_msgs:
+            risk_msgs.append("✅ Ambient in acceptable range for typical operation.")
+        for m in risk_msgs:
+            st.write("• " + m)
 
         st.markdown("### AI Suggestions")
         for s in result["ai_suggestions"]:
@@ -316,7 +346,7 @@ with tab2:
                     df["_Cycle"] = "Curve1"
                     cyc = "_Cycle"
 
-                # 3) Process each group and build combined plotting frames
+                # 3) Process each group; compute features
                 groups = list(df[cyc].astype(str).unique())
                 features_by_group = {}
                 vc_all_rows, ica_all_rows = [], []
@@ -340,16 +370,55 @@ with tab2:
                         "dVdQ_median_abs": dVdQ_med,
                     }
 
-                    # Collect rows for combined Altair plots
+                    # Collect rows for Altair plots (we'll plot after feedback)
                     vc_all_rows.append(pd.DataFrame({"Voltage": V, "Capacity_Ah": Q, "Cycle": g}))
                     ica_all_rows.append(pd.DataFrame({"Voltage": V, "dQdV": dQdV, "Cycle": g}))
 
                 if not features_by_group:
-                    st.error("Not enough valid data points to plot.")
+                    st.error("Not enough valid data points to analyze.")
                     st.stop()
 
-                # ---- Altair Plots (reliable multi-curve) ----
-                st.markdown("### Plots")
+                # ---- (1) DATASET QUALITY & RICHNESS ----
+                st.markdown("### Dataset Quality & Richness")
+                for g, f in features_by_group.items():
+                    st.write(
+                        f"**{g}** — {f['n_samples']} points | "
+                        f"V range: {f['voltage_range_V'][0]:.2f}–{f['voltage_range_V'][1]:.2f} V | "
+                        f"Capacity: {f['cap_range_Ah'][0]:.2f}–{f['cap_range_Ah'][1]:.2f} Ah | "
+                        f"ICA peaks: {f['ica_peaks_count']}"
+                    )
+
+                # Simple richness score (prototype heuristic)
+                richness_notes = []
+                if len(features_by_group) >= 2:
+                    richness_notes.append("✅ Multiple curves detected → enables trend comparisons (fade, peak shifts, impedance).")
+                else:
+                    richness_notes.append("ℹ️ Single curve detected → add an aged or baseline curve for richer insights.")
+
+                any_short = any(f["n_samples"] < 30 for f in features_by_group.values())
+                if any_short:
+                    richness_notes.append("⚠ Some curves have <30 points → derivatives may be noisy; consider higher-resolution sampling.")
+                any_no_peaks = any(f["ica_peaks_count"] == 0 for f in features_by_group.values())
+                if any_no_peaks:
+                    richness_notes.append("ℹ️ ICA shows few/no peaks → may indicate smooth kinetics or insufficient resolution.")
+
+                for rn in richness_notes:
+                    st.write("• " + rn)
+
+                # ---- (2) NEXT-STEP SUGGESTIONS ----
+                st.markdown("### Next-Step Suggestions")
+                if len(features_by_group) == 1:
+                    st.write("• Add a comparison curve (e.g., Fresh vs Aged, Cycle 10 vs Cycle 500) to quantify capacity fade and ICA peak shifts.")
+                    st.write("• Track ICA peak positions/widths across cycles to infer LLI vs LAM vs impedance growth.")
+                    st.write("• Include IR/temperature columns (if available) to correlate electro-thermal behavior.")
+                else:
+                    st.write("• Quantify fade: compute % capacity change between earliest and latest curves.")
+                    st.write("• Track ICA peak shifts (mV) and broadening (mV) → LLI and impedance indicators.")
+                    st.write("• Build a simple regression using extracted features to predict end-of-life or rate performance.")
+                    st.write("• If you have cycle index/time, add it to the dataset for richer trend modeling.")
+
+                # ---- (3) VISUALIZATIONS ----
+                st.markdown("### Visualizations")
                 vc_all = pd.concat(vc_all_rows, ignore_index=True)
                 ica_all = pd.concat(ica_all_rows, ignore_index=True)
 
@@ -380,16 +449,15 @@ with tab2:
                 with c2:
                     st.altair_chart(ica_chart, use_container_width=True)
 
-                # 4) Show features
+                # ---- (4) KEY FEATURES ----
                 st.markdown("### Key Features by Curve")
                 st.write(features_by_group)
 
-                # 5) Dynamic interpretations
+                # ---- (5) DYNAMIC INTERPRETATIONS ----
                 st.markdown("### AI-style Interpretations (dynamic)")
                 interps = []
                 if len(features_by_group) == 1:
                     g = list(features_by_group.keys())[0]
-                    f = features_by_group[g]
                     interps += [
                         "Distinct ICA peaks often indicate well-defined phase transitions.",
                         "Broadening of ICA peaks over time is a common sign of rising impedance.",
@@ -416,7 +484,7 @@ with tab2:
                 for b in interps:
                     st.write("• " + b)
 
-                # 6) Download features
+                # ---- (6) DOWNLOAD FEATURES ----
                 st.download_button(
                     "Download extracted features (JSON)",
                     data=json.dumps(features_by_group, indent=2),
@@ -424,4 +492,7 @@ with tab2:
                     mime="application/json"
                 )
     else:
-        st.info("Upload a **CSV** with `Voltage`, `Capacity_Ah` (or `Capacity_mAh`). Optionally include `Cycle` (e.g., Fresh/Aged). MAT is supported if SciPy is available.")
+        st.info(
+            "Upload a **CSV** with `Voltage`, `Capacity_Ah` (or `Capacity_mAh`). "
+            "Optionally include `Cycle` (e.g., Fresh/Aged). MAT is supported if SciPy is available."
+        )
