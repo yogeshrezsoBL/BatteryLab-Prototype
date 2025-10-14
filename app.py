@@ -136,7 +136,8 @@ def _compare_two_sets(name_a, feat_a, name_b, feat_b):
         if n >= 1:
             mean_broad_mV = 1000.0 * float(np.nanmean(np.array(Wb[:n]) - np.array(Wa[:n])))
             if mean_broad_mV > 2:
-                interp.append(f"ICA peak broadening ~{mean_broad_mV):.0f} mV ({name_b} vs {name_a}).")
+               interp.append(f"ICA peak broadening ~{mean_broad_mV:.0f} mV ({name_b} vs {name_a}).")
+
     iva = feat_a.get("dVdQ_median_abs", np.nan)
     ivb = feat_b.get("dVdQ_median_abs", np.nan)
     if np.isfinite(iva) and np.isfinite(ivb) and ivb > iva * 1.05:
