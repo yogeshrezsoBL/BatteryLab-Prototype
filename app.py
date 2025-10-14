@@ -1,5 +1,5 @@
 # ==============================================================
-# BatteryLab Prototype — Full app with in-tab Copilot only
+# BatteryLab Prototype — Full app with in-tab Copilot + data-aware replies
 # ==============================================================
 
 import io
@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 # Optional (MAT/ICA features)
 try:
     from scipy.signal import savgol_filter, find_peaks, peak_widths
-    from scipy.io import loadmat
+    from scipy.io import loadmat, savemat
     SCIPY_OK = True
 except Exception:
     SCIPY_OK = False
@@ -49,29 +49,11 @@ if "chat_history" not in st.session_state:
 def _copilot_add(role: str, text: str):
     st.session_state.chat_history.append({"role": role, "text": text})
 
-def _copilot_reply(user_text: str, context: str = "general") -> str:
-    # Lightweight friendly responses (placeholder for your Knowledge Core)
-    bank = {
-        "general": [
-            "Got it! What would you like to try next?",
-            "Interesting—want me to suggest the next step?",
-            "Let’s explore that. We can simulate or analyze depending on your goal.",
-        ],
-        "design": [
-            "We can tweak porosity or thickness and re-compute energy density.",
-            "At high ambient T, consider LiFSI + additives like VC/FEC for stability.",
-            "Want me to try a Si fraction of 0.05 and lower anode porosity by 0.02?",
-        ],
-        "analytics": [
-            "We can compare dQ/dV peaks between earliest and latest curves to detect shifts.",
-            "Try plotting ICA vs voltage and overlay two cycles for fade quantification.",
-            "We can correlate capacity fade with |dV/dQ| changes to hint at impedance growth.",
-        ],
-    }
-    key = "design" if "design" in context else ("analytics" if "analytics" in context else "general")
-    choices = bank.get(key, bank["general"])
-    time.sleep(min(1.2, max(0.4, np.random.rand())))  # small human-like delay
-    return np.random.choice(choices)
+# ---- Copilot data caches (latest outputs) ----
+if "latest_design" not in st.session_state:
+    st.session_state.latest_design = None   # {"spec_summary": {...}, "result": {...}}
+if "latest_analytics" not in st.session_state:
+    st.session_state.latest_analytics = None  # {"features_by_group": {...}, "vc_all": DataFrame, "ica_all": DataFrame}
 
 # =========================
 # Helpers (shared)
@@ -154,7 +136,7 @@ def _compare_two_sets(name_a, feat_a, name_b, feat_b):
         if n >= 1:
             mean_broad_mV = 1000.0 * float(np.nanmean(np.array(Wb[:n]) - np.array(Wa[:n])))
             if mean_broad_mV > 2:
-                interp.append(f"ICA peak broadening ~{mean_broad_mV:.0f} mV ({name_b} vs {name_a}).")
+                interp.append(f"ICA peak broadening ~{mean_broad_mV):.0f} mV ({name_b} vs {name_a}).")
     iva = feat_a.get("dVdQ_median_abs", np.nan)
     ivb = feat_b.get("dVdQ_median_abs", np.nan)
     if np.isfinite(iva) and np.isfinite(ivb) and ivb > iva * 1.05:
@@ -352,6 +334,154 @@ def generate_recipe_pdf(spec_summary, result):
     doc.build(elements)
     buffer.seek(0)
     return buffer.getvalue()
+
+# ---------- Data-aware utilities for Copilot ----------
+def _compute_fade_pct(features_by_group: dict) -> str:
+    if not features_by_group or len(features_by_group) < 2:
+        return "I need at least two curves (e.g., Fresh vs Aged) to compute fade."
+    keys = list(features_by_group.keys())
+    def _k(s):
+        import re
+        nums = re.findall(r"\d+", str(s))
+        return int(nums[0]) if nums else 0
+    keys_sorted = sorted(keys, key=_k)
+    a, b = keys_sorted[0], keys_sorted[-1]
+    cap_a = features_by_group[a]["cap_range_Ah"][1]
+    cap_b = features_by_group[b]["cap_range_Ah"][1]
+    if not np.isfinite(cap_a) or not np.isfinite(cap_b) or cap_a <= 0:
+        return "Couldn’t compute fade from the current features."
+    fade = 100.0 * (cap_a - cap_b) / cap_a
+    sign = "fade" if fade >= 0 else "gain"
+    return f"Capacity {sign}: {abs(fade):.1f}% (comparing '{a}' → '{b}')."
+
+def _compute_peak_shift(features_by_group: dict) -> str:
+    if not features_by_group or len(features_by_group) < 2:
+        return "I need at least two curves to estimate ICA peak shifts."
+    keys = list(features_by_group.keys())
+    def _k(s):
+        import re
+        nums = re.findall(r"\d+", str(s))
+        return int(nums[0]) if nums else 0
+    keys_sorted = sorted(keys, key=_k)
+    a, b = keys_sorted[0], keys_sorted[-1]
+    Va = np.array(features_by_group[a]["ica_peak_voltages_V"] or [], dtype=float)
+    Vb = np.array(features_by_group[b]["ica_peak_voltages_V"] or [], dtype=float)
+    if len(Va) == 0 or len(Vb) == 0:
+        return "No ICA peaks detected (or insufficient resolution) to compute peak shifts."
+    n = min(len(Va), len(Vb))
+    shift_mV = 1000.0 * float(np.nanmean(Vb[:n] - Va[:n]))
+    direction = "up" if shift_mV > 0 else "down"
+    return f"Mean ICA peak shift: {abs(shift_mV):.0f} mV {direction} ('{b}' vs '{a}')."
+
+def _compute_broadening(features_by_group: dict) -> str:
+    if not features_by_group or len(features_by_group) < 2:
+        return "I need at least two curves to estimate peak broadening."
+    keys = list(features_by_group.keys())
+    def _k(s):
+        import re
+        nums = re.findall(r"\d+", str(s))
+        return int(nums[0]) if nums else 0
+    keys_sorted = sorted(keys, key=_k)
+    a, b = keys_sorted[0], keys_sorted[-1]
+    Wa = np.array(features_by_group[a]["ica_peak_widths_V"] or [], dtype=float)
+    Wb = np.array(features_by_group[b]["ica_peak_widths_V"] or [], dtype=float)
+    if len(Wa) == 0 or len(Wb) == 0:
+        return "Not enough peak width info to estimate broadening."
+    n = min(len(Wa), len(Wb))
+    broad_mV = 1000.0 * float(np.nanmean(Wb[:n] - Wa[:n]))
+    tag = "broadened" if broad_mV >= 0 else "narrowed"
+    return f"ICA peaks {tag} by ~{abs(broad_mV):.0f} mV ('{b}' vs '{a}')."
+
+def _summarize_design_temperature(result: dict) -> str:
+    if not result:
+        return "Run a design first — I don’t have a computed pouch result yet."
+    tg = result.get("temperature_guidance", {}) or {}
+    ea = result.get("electrochem_temp_adjusted", {}) or {}
+    parts = []
+    parts.append(f"Ambient {tg.get('ambient_C','?')}°C; ideal window {tg.get('ideal_low_C','?')}–{tg.get('ideal_high_C','?')}°C.")
+    if "effective_capacity_Ah_at_ambient" in ea:
+        parts.append(f"Effective capacity @ ambient ~ {ea['effective_capacity_Ah_at_ambient']:.2f} Ah.")
+    if "relative_power_vs_25C" in ea:
+        parts.append(f"Relative power vs 25°C ~ {ea['relative_power_vs_25C']:.2f}×.")
+    if tg.get("cold_temp_risk"): parts.append("Cold-risk flagged → pre-heat or derate C-rate.")
+    if tg.get("high_temp_risk"): parts.append("High-temp risk → consider cooling, high-temp electrolyte, charge derating.")
+    return " ".join(parts) or "No temperature guidance available."
+
+# =========================
+# Data-aware Copilot
+# =========================
+def _copilot_reply(user_text: str, context: str = "general") -> str:
+    """
+    Data-aware Copilot:
+      - understands a few intents
+      - pulls from st.session_state.latest_design / latest_analytics when available
+    """
+    text = (user_text or "").strip().lower()
+
+    # quick intent detection
+    wants_help   = any(k in text for k in ["/help", "help", "what can you do", "commands"])
+    wants_fade   = any(k in text for k in ["fade", "capacity drop", "soh"])
+    wants_shift  = any(k in text for k in ["peak shift", "ica shift", "peak position"])
+    wants_broad  = any(k in text for k in ["broadening", "width", "fwhm"])
+    wants_temp   = any(k in text for k in ["temperature", "thermal", "ambient", "cooling", "heating"])
+    wants_reco   = any(k in text for k in ["recommend", "suggest", "next step", "what next"])
+    wants_best   = any(k in text for k in ["best curve", "which curve", "highest capacity", "lowest fade"])
+
+    # HELP
+    if wants_help:
+        return (
+            "Here’s what I can do now:\n"
+            "• Analytics: fade %, ICA peak shifts, broadening, quick insights (/help, 'fade', 'peak shift', 'broadening').\n"
+            "• Design: summarize temperature risks & adjustments ('temperature summary').\n"
+            "• Recommendations: next steps for analysis or design ('recommend next step').\n"
+            "Tip: upload or analyze data first (Analytics tab), or run Compute Performance (Design tab)."
+        )
+
+    # pull caches
+    la = st.session_state.latest_analytics
+    ld = st.session_state.latest_design
+
+    # ANALYTICS INTENTS
+    if wants_fade and la and la.get("features_by_group"):
+        return _compute_fade_pct(la["features_by_group"])
+
+    if wants_shift and la and la.get("features_by_group"):
+        return _compute_peak_shift(la["features_by_group"])
+
+    if wants_broad and la and la.get("features_by_group"):
+        return _compute_broadening(la["features_by_group"])
+
+    if wants_best and la and la.get("features_by_group"):
+        fbg = la["features_by_group"]
+        best = max(fbg.items(), key=lambda kv: kv[1]["cap_range_Ah"][1])
+        return f"Best curve by capacity: '{best[0]}' (max ~{best[1]['cap_range_Ah'][1]:.2f} Ah)."
+
+    # DESIGN INTENTS
+    if wants_temp and ld and ld.get("result"):
+        return _summarize_design_temperature(ld["result"])
+
+    if wants_reco:
+        if context == "design" and ld and ld.get("result"):
+            tg = ld["result"].get("temperature_guidance", {}) or {}
+            recos = []
+            if tg.get("high_temp_risk"): recos.append("Improve cooling or reduce charge C-rate; consider high-temp electrolyte/additives.")
+            if tg.get("cold_temp_risk"): recos.append("Pre-heat or lower discharge C-rate; increase porosity for low-T power.")
+            recos.append("Try ±5–10 µm cathode thickness and ±0.02 porosity sweep, compare Wh/L vs ΔT@3C.")
+            return " • ".join(recos) if recos else "Looks stable—try small thickness/porosity sweeps to optimize Wh/L vs ΔT."
+        if context == "analytics" and la and la.get("features_by_group"):
+            return (
+                "1) Quantify fade and peak shifts (‘fade’, ‘peak shift’). "
+                "2) If IR/temperature available, correlate with |dV/dQ| median. "
+                "3) Export MAT + repro script, then fit a simple regressor for EOL prediction."
+            )
+
+    # fallbacks by context
+    if context == "design":
+        return "Design Copilot here. Try: 'temperature summary', 'recommend next step'."
+    if context == "analytics":
+        return "Analytics Copilot here. Try: 'fade', 'peak shift', 'broadening', or 'recommend next step'."
+
+    return "Got it! Use /help to see data-aware commands."
 
 # ---------------------------
 # Tabs
@@ -594,6 +724,10 @@ with tab1:
                 file_name="BatteryLab_recipe_report.pdf",
                 mime="application/pdf"
             )
+
+            # Store for Copilot (design cache)
+            st.session_state.latest_design = {"spec_summary": spec_summary, "result": result}
+
         else:
             st.info("Pick a preset for a 1-click demo, or set your recipe parameters, then press Compute Performance.")
 
@@ -601,7 +735,7 @@ with tab1:
         render_copilot(context_key="tab1", default_context="Design")
 
 # =========================
-# TAB 2: Data Analytics WITH in-tab Copilot
+# TAB 2: Data Analytics WITH in-tab Copilot + exports (.mat, .py)
 # =========================
 with tab2:
     col_main, col_chat = st.columns([0.68, 0.32], gap="large")
@@ -674,6 +808,7 @@ with tab2:
                         st.error("Not enough valid data points to analyze.")
                         st.stop()
 
+                    # (1) DATASET QUALITY & RICHNESS
                     st.markdown("### Dataset Quality & Richness")
                     for g, f in features_by_group.items():
                         st.write(
@@ -695,6 +830,7 @@ with tab2:
                     for rn in richness_notes:
                         st.write("- " + rn)
 
+                    # (2) NEXT-STEP SUGGESTIONS
                     st.markdown("### Next-Step Suggestions")
                     suggestions = []
                     if len(features_by_group) == 1:
@@ -779,6 +915,112 @@ with tab2:
                         for b in interps:
                             st.write("- " + b)
 
+                        # ---------------------------
+                        # Export: .mat data + .py repro script
+                        # ---------------------------
+                        def _build_repro_script_py(default_mat_name="BatteryLab_analytics_data.mat"):
+                            return f"""# Reproduce BatteryLAB analytics plots
+import sys
+import numpy as np
+import matplotlib.pyplot as plt
+
+try:
+    from scipy.io import loadmat
+except Exception as e:
+    raise SystemExit("This script needs SciPy: pip install scipy") from e
+
+fname = sys.argv[1] if len(sys.argv) > 1 else "{default_mat_name}"
+m = loadmat(fname, squeeze_me=True)
+
+# Voltage–Capacity table
+V1   = m['vc_voltage']
+Q1   = m['vc_capacity_ah']
+c1   = m['vc_cycle_idx'].astype(int)
+n1   = [str(x) for x in (m['vc_cycle_names'].tolist() if hasattr(m['vc_cycle_names'], 'tolist') else m['vc_cycle_names'])]
+
+# ICA table
+V2   = m['ica_voltage']
+dqdv = m['ica_dqdv']
+c2   = m['ica_cycle_idx'].astype(int)
+n2   = [str(x) for x in (m['ica_cycle_names'].tolist() if hasattr(m['ica_cycle_names'], 'tolist') else m['ica_cycle_names'])]
+
+# Plot Voltage–Capacity
+plt.figure()
+for idx in np.unique(c1):
+    mask = (c1 == idx)
+    plt.plot(V1[mask], Q1[mask], label=n1[int(idx)])
+plt.xlabel('Voltage (V)')
+plt.ylabel('Capacity (Ah)')
+plt.title('Voltage vs Capacity')
+plt.legend()
+plt.tight_layout()
+
+# Plot ICA
+plt.figure()
+for idx in np.unique(c2):
+    mask = (c2 == idx)
+    plt.plot(V2[mask], dqdv[mask], label=n2[int(idx)])
+plt.xlabel('Voltage (V)')
+plt.ylabel('dQ/dV (Ah/V)')
+plt.title('ICA: dQ/dV vs Voltage')
+plt.legend()
+plt.tight_layout()
+plt.show()
+"""
+
+                        # Build .mat payload (handles arbitrary # of curves)
+                        vc_cat = vc_all["Cycle"].astype("category")
+                        ica_cat = ica_all["Cycle"].astype("category")
+
+                        vc_cycle_idx = vc_cat.cat.codes.to_numpy().astype(np.int32)
+                        vc_cycle_names = np.array(vc_cat.cat.categories.tolist(), dtype=object)
+
+                        ica_cycle_idx = ica_cat.cat.codes.to_numpy().astype(np.int32)
+                        ica_cycle_names = np.array(ica_cat.cat.categories.tolist(), dtype=object)
+
+                        # Prepare binary buffers for both files
+                        py_script_text = _build_repro_script_py()
+                        py_bytes = py_script_text.encode("utf-8")
+
+                        if SCIPY_OK:
+                            mat_buf = io.BytesIO()
+                            savemat(mat_buf, {
+                                # VC table
+                                "vc_voltage":      vc_all["Voltage"].to_numpy().astype(float),
+                                "vc_capacity_ah":  vc_all["Capacity_Ah"].to_numpy().astype(float),
+                                "vc_cycle_idx":    vc_cycle_idx,
+                                "vc_cycle_names":  vc_cycle_names,
+                                # ICA table
+                                "ica_voltage":     ica_all["Voltage"].to_numpy().astype(float),
+                                "ica_dqdv":        ica_all["dQdV"].to_numpy().astype(float),
+                                "ica_cycle_idx":   ica_cycle_idx,
+                                "ica_cycle_names": ica_cycle_names,
+                            })
+                            mat_buf.seek(0)
+                        else:
+                            mat_buf = None  # SciPy not available
+
+                        c_dl1, c_dl2 = st.columns(2)
+                        with c_dl1:
+                            if SCIPY_OK and mat_buf is not None:
+                                st.download_button(
+                                    "Download analytics data (.mat)",
+                                    data=mat_buf.getvalue(),
+                                    file_name="BatteryLab_analytics_data.mat",
+                                    mime="application/octet-stream"
+                                )
+                            else:
+                                st.info("Install SciPy on the server to enable `.mat` export (pip install scipy).")
+
+                        with c_dl2:
+                            st.download_button(
+                                "Download repro plot script (.py)",
+                                data=py_bytes,
+                                file_name="repro_analytics_plots.py",
+                                mime="text/x-python"
+                            )
+
+                        # PDF Download
                         pdf_bytes = generate_pdf_report(
                             features_by_group=features_by_group,
                             richness_notes=richness_notes,
@@ -793,6 +1035,13 @@ with tab2:
                             file_name="BatteryLab_analytics_report.pdf",
                             mime="application/pdf"
                         )
+
+                        # Store for Copilot (analytics cache)
+                        st.session_state.latest_analytics = {
+                            "features_by_group": features_by_group,
+                            "vc_all": vc_all,
+                            "ica_all": ica_all,
+                        }
                     else:
                         st.info("Click **Visualize recommended plots** to render charts, then see Key Features, interpretations, and download the PDF report.")
         else:
